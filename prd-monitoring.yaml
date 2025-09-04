@@ -1,0 +1,650 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: PRD Environment - Monitoring Stack 
+
+
+Parameters:
+  ProdVpcCidr:
+    Type: String
+    Default: 10.0.83.0/24
+  ProdSubnet1Cidr:
+    Type: String
+    Default: 10.0.83.0/26
+  ProdSubnet2Cidr:
+    Type: String
+    Default: 10.0.83.64/26
+  WindowsAmiId:
+    Type: String
+    Description: Windows AMI ID for EC2 instances
+  RHEL8AmiId:
+    Type: String
+    Description: RHEL8 AMI ID for EC2 instances
+  InstanceTypeWindows:
+    Type: String
+    Default: c6i.2xlarge
+  InstanceTypeLinux:
+    Type: String
+    Default: m6i.xlarge
+
+  ProdCloudWatchLogGroupName:
+    Type: String
+    Description: CloudWatch log group for VPC Flow Logs
+    Default: cwlg-log-prod
+
+Resources:
+  VPCBlockPublicAccess:
+    Type: AWS::EC2::VPCBlockPublicAccessOptions
+    Properties:
+      InternetGatewayBlockMode: block-bidirectional
+
+  AccessAnalyzer:
+    Type: AWS::AccessAnalyzer::Analyzer
+    Properties:
+      AnalyzerName: ExternalAccessAnalyzer
+      Type: ACCOUNT
+      Tags:
+        - Key: Purpose
+          Value: MonitorExternalAccess
+      
+  # -------------------- VPC & Subnets --------------------
+  PRDVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref ProdVpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: vpc-log-prd-euw1-01 }
+
+  PRDSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PRDVPC
+      CidrBlock: !Ref ProdSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags: [{ Key: Name, Value: sn-monitoring-euw1a }]
+
+  PRDSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PRDVPC
+      CidrBlock: !Ref ProdSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags: [{ Key: Name, Value: sn-monitoring-euw1b }]
+
+  # -------------------- Route Table --------------------
+  PRDPrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref PRDVPC
+      Tags:
+        - { Key: Name, Value: rtb-log-prd-monitoring-euw1 }
+
+  PRDAssociationA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PRDSubnetA
+      RouteTableId: !Ref PRDPrivateRouteTable
+
+  PRDAssociationB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PRDSubnetB
+      RouteTableId: !Ref PRDPrivateRouteTabl
+
+# -------------------- IAM Role --------------------
+  EC2SSMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: iam-log-dplyssmcom
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonSSMPatchAssociation
+      Tags:
+        - Key: Name
+          Value: iam-log-dplyssmcom
+
+  EC2SSMInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: "log-iam-instance-profile"
+      Roles: [!Ref EC2SSMRole]
+  
+  # -------------------- Flow Logs --------------------
+  ProdFLowLogsKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: "KMS key for encription CloudWatch logs"
+      EnableKeyRotation: true
+      Keypolicy:
+        Version: "2012-10-17"
+        Statement:
+        # Allow Root account for full access over key
+          - Sid: EnableIAMUserPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: "kms:*"
+            Resource: "*"
+        # Allow CLoudwatch Logs & VPC Flow Logs to use the key
+          - Sid: AllowCWandFlowLogs
+            Effect: Allow
+            Principal:
+              Service: logs.eu-west-1.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub arn:aws:logs:eu-west-1:${AWS::AccountId}:*
+      Tags: 
+        - Key: Name
+          Value: kms-log-prod
+  ProdFlowLogsKMSALias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/vpcflowlogs-key-log
+      TargetKeyID: !Ref ProdFLowLogsKMSKey
+
+  ProdCloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    DependsOn: ProdFLowLogsKMSKey
+    Properties:
+      LogGroupName: !Ref ProdCloudWatchLogGroupName
+      RetentionInDays: 365
+      KmsKeyId: !GetAtt ProdFLowLogsKMSKey.Arn
+  VPCFlowLog:
+    Type: AWS::EC2::FlowLog
+    DependsOn: ProdCloudWatchLogGroup
+    Properties:
+      DeliverLogsPermissionArn: !GetAtt ProdFlowLogRole.Arn
+      LogGroupName: !Ref ProdCloudWatchLogGroup
+      ResourceId: !Ref ProdVPC
+      ResourceType: VPC
+      TrafficType: ALL
+
+  PRDFlowLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: iam-log-dplylogsprod  
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: vpc-flow-logs-to-cwl
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${ProdCloudWatchLogGroupName}:*
+
+
+
+  # -------------------- Security Groups --------------------
+  SSMVPCEndpointSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: sg-log-secendpoints
+      VpcId: !Ref ProdVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref ProdVpcCidr
+          Description: Allow HTTPS from Endpoints
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref ProdVpcCidr
+          Description: Allow HTTPS from Endpoints
+      Tags: [{ Key: Name, Value: sg-logendpoints-prd-vpce }]
+
+  
+  SGSite247PRD:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: sg-site247-prd-ec2
+      VpcId: !Ref PRDVPC
+      SecurityGroupIngress:
+        # Site24x7 SaaS Platform TCP 443
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 31.186.243.0/24
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 185.20.209.0/24
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 213.244.146.0/24
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 185.230.212.0/23
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 87.252.213.0/24
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 89.36.170.0/24
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 217.163.72.0/24
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 185.230.214.0/23
+        # Poller to Network Device (SNMP) UDP 161
+        - IpProtocol: udp
+          FromPort: 161
+          ToPort: 161
+          CidrIp: 172.16.20.0/26
+        - IpProtocol: udp
+          FromPort: 161
+          ToPort: 161
+          CidrIp: 172.16.36.0/26
+        - IpProtocol: udp
+          FromPort: 161
+          ToPort: 161
+          CidrIp: 172.16.52.0/26
+        - IpProtocol: udp
+          FromPort: 161
+          ToPort: 161
+          CidrIp: 172.16.68.0/26
+        - IpProtocol: udp
+          FromPort: 161
+          ToPort: 161
+          CidrIp: 10.0.64.0/24
+        - IpProtocol: udp
+          FromPort: 161
+          ToPort: 161
+          CidrIp: 10.0.65.0/24
+        - IpProtocol: udp
+          FromPort: 161
+          ToPort: 161
+          CidrIp: 10.0.66.0/24
+        # Site24x7 to Vinci TCP 443
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.0.83.0/24
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref SSMVPCEndpointSG
+          Description: Allow HTTPS from Endpoints
+        # Poller to Meraki TCP 443 (add Meraki API Endpoint IP if available)
+        # - IpProtocol: tcp
+        #   FromPort: 443
+        #   ToPort: 443
+        #   CidrIp: <Meraki API Endpoint IP>
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 31.186.243.0/24
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 185.20.209.0/24
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 213.244.146.0/24
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 185.230.212.0/23
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 87.252.213.0/24
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 89.36.170.0/24
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 217.163.72.0/24
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 185.230.214.0/23
+      Tags:
+        - { Key: Name, Value: sg-site247-prd-ec2 }
+
+  SGVinciCorePRD:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: sg-vincicore-prd-ec2
+      VpcId: !Ref PRDVPC
+      SecurityGroupIngress:
+        # Vinci Core Server TCP 443 (Vinci Automation Server)
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.0.83.0/24
+           CidrIp: 10.0.83.0/24
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref SSMVPCEndpointSG
+          Description: Allow HTTPS from Endpoints
+        # ServiceNow URLs (add actual IPs or CIDRs as needed)
+        # - IpProtocol: tcp
+        #   FromPort: 443
+        #   ToPort: 443
+        #   CidrIp: <ServiceNow_IP_or_CIDR>
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.0.83.0/24
+      Tags:
+        - { Key: Name, Value: sg-vincicore-prd-ec2 }
+
+  SGVinciAutomationPRD:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: sg-vinciautomation-prd-ec2
+      VpcId: !Ref PRDVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 10.0.83.0/24
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.0.83.0/24
+        - IpProtocol: tcp
+          FromPort: 5985
+          ToPort: 5986
+          CidrIp: 10.0.0.0/14
+        - IpProtocol: tcp
+          FromPort: 135
+          ToPort: 135
+          CidrIp: 10.0.0.0/14
+        - IpProtocol: tcp
+          FromPort: 49152
+          ToPort: 65535
+          CidrIp: 10.0.0.0/14
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 10.0.0.0/14
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 10.0.0.0/14
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 10.0.0.0/14
+        - IpProtocol: tcp
+          FromPort: 25
+          ToPort: 25
+          CidrIp: 0.0.0.0/0
+          CidrIp: 10.0.83.0/24
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref SSMVPCEndpointSG
+          Description: Allow HTTPS from Endpoints
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 10.0.83.0/24
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.0.83.0/24
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+           IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          DestinationSecurityGroupId: !Ref SSMVPCEndpointSG
+          Description: Allow HTTPS from Endpoints
+      Tags:
+        - { Key: Name, Value: sg-vinciautomation-prd-ec2 }
+####################
+ # RDP EndPoints #
+####################  
+  SSMVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ssm"
+      VpcId: !Ref ProdVPC
+      SubnetIds:
+        - !Ref ProdSubnet1
+        - !Ref ProdSubnet2
+      SecurityGroupIds:
+        - !Ref SSMVPCEndpointSG
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      Tags:
+        - Key: Name
+          Value: vpce-log-ssmendpoint
+
+  SSMMessagesVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ssmmessages"
+      VpcId: !Ref ProdVPC
+      SubnetIds:
+        - !Ref ProdSubnet1
+        - !Ref ProdSubnet2
+      SecurityGroupIds:
+        - !Ref SSMVPCEndpointSG
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      Tags:
+        - Key: Name
+          Value: vpce-log-ssmmessagesendpoint
+
+  EC2MessagesVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ec2messages"
+      VpcId: !Ref ProdVPC
+      SubnetIds:
+        - !Ref ProdSubnet1
+        - !Ref ProdSubnet2
+      SecurityGroupIds:
+        - !Ref SSMVPCEndpointSG
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      Tags:
+        - Key: Name
+          Value: vpce-log-ec2messagesendpoint
+
+
+ SECCMKEC2:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: CMK for EC2 Instances encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowRootAccountFullAccess
+            Effect: Allow
+            Principal: 
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: "kms:*"
+            Resource: "*"
+
+          - Sid: AllowEC2
+            Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action:
+              - kms:Describe*
+              - kms:List*
+              - kms:Get*
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:CreateGrant
+            Resource: "*"
+            Condition:
+              StringEquals:
+                kms:ViaService: !Sub ec2.${AWS::Region}.amazonaws.com
+                kms:CallerAccount: !Ref AWS::AccountId
+
+ 
+  EC2BuilderCMKAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/ims-log-ebs
+      TargetKeyId: !Ref SECCMKEC2
+
+
+  # -------------------- EC2 Instances --------------------
+  PRDSite247InstanceA:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceTypeWindows
+      ImageId: !Ref WindowsAmiId
+      KeyName: ims-log-ec2-keypair
+      SubnetId: !Ref PRDSubnetA
+      SecurityGroupIds:
+        - !Ref SGSite247PRD
+      IamInstanceProfile: !Ref EC2SSMInstanceProfile
+      DisableApiTermination: true
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 200
+            VolumeType: gp3
+            Encrypted: true
+            KmsKeyId: !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/ims-log-ebs
+      MetadataOptions:
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+        HttpEndpoint: enabled
+      Tags:
+        - Key: Name
+          Value: mon-prd-247-01
+
+  PRDSite247InstanceB:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceTypeWindows
+      ImageId: !Ref WindowsAmiId
+      KeyName: ims-log-ec2-keypair
+      SubnetId: !Ref PRDSubnetB
+      SecurityGroupIds:
+        - !Ref SGSite247PRD
+      IamInstanceProfile: !Ref EC2SSMInstanceProfile
+      DisableApiTermination: true
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 200
+            VolumeType: gp3
+            Encrypted: true
+            KmsKeyId: !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/ims-log-ebs
+      MetadataOptions:
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+        HttpEndpoint: enabled
+      Tags:
+        - Key: Name
+          Value: mon-prd-247-02
+
+  PRDVinciCoreInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceTypeLinux
+      ImageId: !Ref RHEL8AmiId
+      KeyName: ims-log-ec2-keypair
+      SubnetId: !Ref PRDSubnetA
+      SecurityGroupIds:
+        - !Ref SGVinciCorePRD
+      IamInstanceProfile: !Ref EC2SSMInstanceProfile
+      DisableApiTermination: true
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 350
+            VolumeType: gp3
+            Encrypted: true
+            KmsKeyId: !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/ims-log-ebs
+      MetadataOptions:
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+        HttpEndpoint: enabled
+      Tags:
+        - Key: Name
+          Value: mon-prd-vco-01
+
+  PRDVinciAutomationInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceTypeLinux
+      ImageId: !Ref RHEL8AmiId
+      KeyName: ims-log-ec2-keypair
+      SubnetId: !Ref PRDSubnetB
+      SecurityGroupIds:
+        - !Ref SGVinciAutomationPRD
+      IamInstanceProfile: !Ref EC2SSMInstanceProfile
+      DisableApiTermination: true
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 350
+            VolumeType: gp3
+            Encrypted: true
+            KmsKeyId: !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/ims-log-ebs
+      MetadataOptions:
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+        HttpEndpoint: enabled
+      Tags:
+        - Key: Name
+          Value: mon-prd-vau-01
+
+Outputs:
+  VpcId:
+    Value: !Ref PRDVPC
+  Site247InstanceAId:
+    Value: !Ref PRDSite247InstanceA
+  Site247InstanceBId:
+    Value: !Ref PRDSite247InstanceB
+  VinciCoreInstanceId:
+    Value: !Ref PRDVinciCoreInstance
+  VinciAutomationInstanceId:
+    Value: !Ref PRDVinciAutomationInstance
+  PRDIamRoleName:
+    Value: !Ref PRDIamRole
+  
